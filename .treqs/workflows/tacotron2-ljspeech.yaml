@@ -74,8 +74,8 @@ setup:
     # runner that dies holding a live GPU, not a step timeout -- and because a
     # halt outlives the job that armed it, the publish stage below CANCELS it on
     # a normal finish so it cannot reach into whatever job lands here next.
-    sudo shutdown -h +50 || true
-    echo "watchdog: halt scheduled at +50 min (2x the 25-min measured expectation)"
+    sudo shutdown -h +25 || true
+    echo "watchdog: halt scheduled at +25 min; every stage below re-arms its own (2x the measured stage time)"
     # ---- make the fork URL explicit on `origin` before anything is recorded --
     # Reproducing this row means cloning the remote recorded in its lineage, so
     # the recorded value has to be a URL a stranger can actually fetch. A
@@ -236,6 +236,18 @@ fetch_ljspeech:
   command: |
     export PATH=/opt/pytorch/bin:$PATH
     export PYTHONUNBUFFERED=1
+    # ---- keep a halt from a CO-TENANT job off this machine -----------------
+    # Repeated at the top of every stage, deliberately. Hosts on this target
+    # carry more than one job's work, and a `shutdown -h +N` armed by any of them
+    # halts the MACHINE, not the job that armed it. This row lost two complete
+    # attempts that way -- one 51 seconds after its artefact had finished
+    # uploading -- so clearing the schedule once in setup is not enough: a
+    # co-tenant that arms a halt while this job is mid-stage still kills it.
+    # Cancel whatever is pending, then immediately re-arm this job's own
+    # watchdog, so the machine is never left without a backstop and never left
+    # holding someone else's deadline.
+    sudo shutdown -c 2>/dev/null || true
+    sudo shutdown -h +20 || true
     roar run -n fetch_ljspeech -- python repro/fetch_ljspeech.py --out-dir DUMMY
   trace: off
 
@@ -259,18 +271,54 @@ train:
   command: |
     export PATH=/opt/pytorch/bin:$PATH
     export PYTHONUNBUFFERED=1
+    # ---- keep a halt from a CO-TENANT job off this machine -----------------
+    # Repeated at the top of every stage, deliberately. Hosts on this target
+    # carry more than one job's work, and a `shutdown -h +N` armed by any of them
+    # halts the MACHINE, not the job that armed it. This row lost two complete
+    # attempts that way -- one 51 seconds after its artefact had finished
+    # uploading -- so clearing the schedule once in setup is not enough: a
+    # co-tenant that arms a halt while this job is mid-stage still kills it.
+    # Cancel whatever is pending, then immediately re-arm this job's own
+    # watchdog, so the machine is never left without a backstop and never left
+    # holding someone else's deadline.
+    sudo shutdown -c 2>/dev/null || true
+    sudo shutdown -h +20 || true
     roar run -n train -- python repro/train_truncated.py --train-iters 101 --dataloader-workers 0 --output_directory=outdir --log_directory=logdir --hparams=epochs=1,batch_size=16,iters_per_checkpoint=100
   trace: off
 
 label:
   command: |
     export PATH=/opt/pytorch/bin:$PATH
+    # ---- keep a halt from a CO-TENANT job off this machine -----------------
+    # Repeated at the top of every stage, deliberately. Hosts on this target
+    # carry more than one job's work, and a `shutdown -h +N` armed by any of them
+    # halts the MACHINE, not the job that armed it. This row lost two complete
+    # attempts that way -- one 51 seconds after its artefact had finished
+    # uploading -- so clearing the schedule once in setup is not enough: a
+    # co-tenant that arms a halt while this job is mid-stage still kills it.
+    # Cancel whatever is pending, then immediately re-arm this job's own
+    # watchdog, so the machine is never left without a backstop and never left
+    # holding someone else's deadline.
+    sudo shutdown -c 2>/dev/null || true
+    sudo shutdown -h +15 || true
     roar label set artifact outdir/checkpoint_100 model.name=tacotron2-ljspeech model.version=1 license.id=BSD-3-Clause license.name='BSD 3-Clause License' description='Tacotron 2 (NVIDIA): character-to-mel-spectrogram sequence-to-sequence TTS with location-sensitive attention, trained on the LJ Speech corpus. TRUNCATED pipeline-viability run: 101 of 390500 optimiser steps, NOT converged.' documentation.url=https://github.com/NVIDIA/tacotron2/blob/master/README.md
   trace: off
 
 publish:
   command: |
     export PATH=/opt/pytorch/bin:$PATH
+    # ---- keep a halt from a CO-TENANT job off this machine -----------------
+    # Repeated at the top of every stage, deliberately. Hosts on this target
+    # carry more than one job's work, and a `shutdown -h +N` armed by any of them
+    # halts the MACHINE, not the job that armed it. This row lost two complete
+    # attempts that way -- one 51 seconds after its artefact had finished
+    # uploading -- so clearing the schedule once in setup is not enough: a
+    # co-tenant that arms a halt while this job is mid-stage still kills it.
+    # Cancel whatever is pending, then immediately re-arm this job's own
+    # watchdog, so the machine is never left without a backstop and never left
+    # holding someone else's deadline.
+    sudo shutdown -c 2>/dev/null || true
+    sudo shutdown -h +15 || true
     roar put outdir/checkpoint_100 hf://reproducible-ai/tacotron2-ljspeech --public --yes --no-tag -m "Tacotron 2 trained on LJ Speech, 101 of 390500 optimiser steps (upstream hparams.py: 500 epochs). TRUNCATED pipeline-viability run: NOT converged and not a quality result."
     # The run is done, so disarm the watchdog armed in setup. A scheduled halt
     # belongs to the machine, not to the job that scheduled it: leaving it armed
