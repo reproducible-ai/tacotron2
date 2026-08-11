@@ -43,20 +43,39 @@ setup:
     python -m pip install --quiet requests || true
     rm -rf *.egg-info src/*.egg-info
     df -h / | tail -1
+    # ---- cancel any halt this host inherited from a previous job ----------
+    # On-demand hosts on this target are REUSED across queued jobs, and every
+    # campaign job schedules a `shutdown -h +N` watchdog in its own setup stage.
+    # A watchdog is a property of the machine, not of the job that armed it, so
+    # the second job to land on a host inherits the first job's halt time and
+    # dies at a moment that has nothing to do with its own work. This row lost a
+    # complete, successful run that way: the host was launched at 19:38:32 for
+    # the job ahead of it in the queue, this row's job started on it at 19:42:15,
+    # and the machine halted at 20:00:11 -- 21.6 minutes of HOST life, 51 seconds
+    # after the 338 MB artefact had finished uploading and while `roar put` was
+    # still registering the lineage. Every traced step had succeeded; the DAG was
+    # never published. The identical 21.6-minute host lifetime was visible on the
+    # preceding host on this target, which is what identified the cause.
+    # Clearing the inherited halt costs nothing and the row's own watchdog is
+    # armed on the next line.
+    sudo shutdown -c 2>/dev/null || true
+    echo "cleared any inherited shutdown; arming this job's own watchdog"
     # ---- self-terminating watchdog, sized from a measurement --------------
-    # Expectation for this run is ~30 minutes, from measurements taken on CPU
-    # before booking this host: provisioning and setup ~7 (the dependency install
-    # below is ~15 wheels), fetch ~9 (2.6 GB download, a 2.6 GB sha256 measured at
-    # 25s, and a 13100-file bzip2 extraction measured at 636s on a contended
-    # 4-core box), train ~9 (101 optimiser steps; the dataset side is measured at
-    # 0.015s per utterance so the GPU decoder dominates, plus two full validation
-    # passes over the 100-utterance validation filelist), label and publish ~4 (a
-    # ~340 MB checkpoint upload). The watchdog is 2x that. It is a backstop
-    # against an operator or a job runner that dies holding a live GPU, not a step
-    # timeout: if the run finishes normally the host is torn down long before this
-    # fires.
-    sudo shutdown -h +60 || true
-    echo "watchdog: halt scheduled at +60 min (2x the 30-min measured expectation)"
+    # Expectation for this run is ~25 minutes of host life, now MEASURED rather
+    # than guessed -- a first, complete attempt ran every step successfully on
+    # this exact target before an inherited halt cut its lineage publication
+    # short: provisioning 3m43s, setup 4m37s (the dependency install is ~15
+    # wheels), fetch 5m14s (23.3s to download 2.6 GB at 118 MB/s, 7.6s to
+    # sha256 it, 250.3s to extract 13100 wav files from bzip2), train 7m04s
+    # (403.6s inside train(): 101 optimiser steps at 2.9s/step plus two full
+    # validation passes over the 100-utterance validation filelist), label 1s,
+    # publish ~3m (a 338 MB checkpoint at ~27 MB/s plus lineage registration).
+    # The watchdog is 2x that. It is a backstop against an operator or a job
+    # runner that dies holding a live GPU, not a step timeout -- and because a
+    # halt outlives the job that armed it, the publish stage below CANCELS it on
+    # a normal finish so it cannot reach into whatever job lands here next.
+    sudo shutdown -h +50 || true
+    echo "watchdog: halt scheduled at +50 min (2x the 25-min measured expectation)"
     # ---- make the fork URL explicit on `origin` before anything is recorded --
     # Reproducing this row means cloning the remote recorded in its lineage, so
     # the recorded value has to be a URL a stranger can actually fetch. A
@@ -253,4 +272,9 @@ publish:
   command: |
     export PATH=/opt/pytorch/bin:$PATH
     roar put outdir/checkpoint_100 hf://reproducible-ai/tacotron2-ljspeech --public --yes --no-tag -m "Tacotron 2 trained on LJ Speech, 101 of 390500 optimiser steps (upstream hparams.py: 500 epochs). TRUNCATED pipeline-viability run: NOT converged and not a quality result."
+    # The run is done, so disarm the watchdog armed in setup. A scheduled halt
+    # belongs to the machine, not to the job that scheduled it: leaving it armed
+    # is how this row's first attempt was killed, by a halt some earlier job on
+    # the same reused host had left behind.
+    sudo shutdown -c 2>/dev/null || true
   trace: off
