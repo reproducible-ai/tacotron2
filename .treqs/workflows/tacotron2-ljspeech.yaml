@@ -39,8 +39,7 @@ secrets:
 setup:
   command: |
     export PATH=/opt/pytorch/bin:$PATH
-    python -c "import sys; print('python', sys.version)"
-    python -m pip install --quiet requests || true
+    /opt/pytorch/bin/python -c "import sys; print('inherited python', sys.version)"
     rm -rf *.egg-info src/*.egg-info
     df -h / | tail -1
     # ---- cancel any halt this host inherited from a previous job ----------
@@ -90,6 +89,50 @@ setup:
     git remote -v
     test "$(git remote get-url origin)" = "https://github.com/reproducible-ai/tacotron2.git" \
       || { echo "origin is not the fork URL: $(git remote get-url origin)"; exit 1; }
+    # ---- (b0) FORENSIC: what interpreter did this WARM box hand us? ---------
+    # Campaign hosts are handed out warm -- an instance can have served an
+    # earlier job before this one was even queued -- and campaign setup stages
+    # install into the SHARED /opt/pytorch interpreter. So the environment this
+    # job starts with is a property of whatever ran here first, and it is
+    # unreconstructible once the job ends. This row has already seen the shared
+    # interpreter report torch 2.3.0+cu121 on one attempt and torch 2.7.0+cu126
+    # on two others, same target, same AMI, same afternoon.
+    #
+    # Dump it BEFORE this stage installs anything, against the INHERITED
+    # interpreter rather than this row's venv, so the starting state is evidence.
+    /opt/pytorch/bin/python repro/inherited_env.py || true
+    # ---- (b1) an ISOLATED venv -- do not trust the shared interpreter --------
+    # Everything this workload needs is installed into a venv of this row's own,
+    # with NO system site-packages, and that venv goes first on PATH in every
+    # stage below. Two reasons, both measured on this campaign today:
+    #
+    #   * what we would inherit is not stable. Another row's setup stage
+    #     downgraded huggingface-hub in the shared interpreter; another
+    #     downgraded torch. Either lands silently in this row's recorded freeze.
+    #   * what we install leaks the other way. This row's earlier attempts
+    #     installed librosa, soundfile, audioread, resampy, numba and llvmlite
+    #     into /opt/pytorch, and they turned up in a concurrent row's record.
+    #     An isolated venv is the fix for both directions at once.
+    #
+    # `uv` is NOT absent from this image -- it is absent from PATH. Probe the
+    # three places it lives before bootstrapping anything.
+    export PATH=$PATH:/root/.local/bin:$HOME/.local/bin:/usr/local/bin
+    command -v uv >/dev/null || { curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh; }
+    echo "uv: $(command -v uv) $(uv --version)"
+    rm -rf /opt/row015-venv
+    uv venv --python /opt/pytorch/bin/python /opt/row015-venv
+    # The pins and the upstream line numbers that force them are documented at
+    # (b2) below. torch is pinned to the version the campaign image ships so the
+    # recorded freeze is installable from PyPI as-is; the CUDA runtime comes with
+    # it, from the nvidia-* wheels torch declares, rather than from the image.
+    uv pip install --python /opt/row015-venv/bin/python \
+      "torch==2.7.0" "numpy==1.26.4" "scipy==1.17.1" "librosa==0.9.2" \
+      "setuptools==79.0.1" "matplotlib==3.9.4" inflect Unidecode tensorboard
+    # From here on, `python` means THIS row's interpreter, in every stage.
+    export PATH=/opt/row015-venv/bin:$PATH
+    python -c "import sys; print('recorded python:', sys.executable, sys.version.split()[0])"
+    python -c "import torch, numpy, scipy, librosa, matplotlib; print('torch', torch.__version__, '| numpy', numpy.__version__, '| scipy', scipy.__version__, '| librosa', librosa.__version__, '| matplotlib', matplotlib.__version__)"
+    python -c "import torch; print('cuda', torch.cuda.is_available(), '|', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU ONLY')"
     # ---- (a) provenance CLI: purge, install by version, verify by sha256 -----
     # P0-7: deleting only the .dist-info leaves an importable `roar/` package dir
     # behind, and a bare /usr/local/bin/roar has been caught importing it and
@@ -104,16 +147,11 @@ setup:
                 /opt/pytorch/bin/roar /opt/pytorch/bin/roar-worker \
                 /usr/local/lib/python3.10/dist-packages/roar_inject.pth \
                 /opt/pytorch/lib/python3.12/site-packages/roar_inject.pth
-    # `uv` is not on PATH on every campaign AMI (this stage runs as root and
-    # /root/.local/bin is not always inherited), so make it explicit and
-    # bootstrap it if the image lacks it. This stage is `trace: off`.
-    export PATH=$PATH:/root/.local/bin:/usr/local/bin
-    command -v uv >/dev/null || { curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh; }
-    command -v uv
-    # P0-14: install the CLI under the SAME interpreter the workload records, or
-    # that interpreter's site-packages can shadow the recorded pins inside the
-    # traced child and the run passes against host packages instead.
-    RECORDED_PY="$(python -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')"
+    # P0-14: install the CLI under the SAME interpreter the workload records --
+    # which is now this row's venv, not the shared one -- or that interpreter's
+    # site-packages can shadow the recorded pins inside the traced child and the
+    # run passes against host packages instead.
+    RECORDED_PY="$(/opt/row015-venv/bin/python -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')"
     echo "recorded interpreter: $RECORDED_PY"
     # `--index-strategy unsafe-best-match` is REQUIRED: uv gives an
     # --extra-index-url priority over the --index-url, so with the default
@@ -150,14 +188,14 @@ setup:
     # needs no special permissions, so a visitor reproduces with the SAME tracer.
     roar tracer use preload
     roar tracer
-    # ---- (b) this repository's dependencies, and why each ceiling exists -----
+    # ---- (b2) why each pin above is a CEILING, not a preference -------------
     # requirements.txt is from 2019 and pins matplotlib==2.1.0, tensorflow==1.15.2,
     # numpy==1.13.3, inflect==0.2.5, librosa==0.6.0, scipy==1.0.0,
     # Unidecode==1.0.22, pillow. Not one of those first seven installs on CPython
     # 3.12: they predate it by years and publish no wheels for it. So the row runs
     # upstream's code against modern releases -- but NOT the newest, because four
     # specific upstream lines stop working at four specific versions. Each ceiling
-    # below is forced by a line of code, not by taste, and repro/preflight_cpu.py
+    # is forced by a line of code, not by taste, and repro/preflight_cpu.py
     # asserts every one of them on CPU before this run spends a GPU-minute:
     #
     #   librosa==0.9.2    layers.py:50 calls librosa.filters.mel(sr, n_fft, n_mels,
@@ -176,9 +214,7 @@ setup:
     #                     ("ValueError: The binary mode of fromstring is removed").
     #                     That line runs inside logger.log_validation, i.e. at the
     #                     FIRST checkpoint -- so with numpy 2.x this row would train
-    #                     correctly and then die on the validation pass. This is a
-    #                     real, recorded downgrade from the image's numpy 2.4.4;
-    #                     torch 2.7.0's numpy interop was verified against it.
+    #                     correctly and then die on the validation pass.
     #   matplotlib==3.9.4 plotting_utils.py:9 also calls fig.canvas.tostring_rgb(),
     #                     REMOVED in matplotlib 3.10. Same code path, same timing.
     #   scipy==1.17.1     forced by numpy: scipy 1.18 requires numpy>=2.0.
@@ -192,11 +228,6 @@ setup:
     # pinned tensorflow==1.15.2 has no wheel for any interpreter after 3.7.
     # repro/tf_hparams_shim.py supplies that container so upstream's hparams.py --
     # and therefore upstream's own epochs=500 default -- is read as published.
-    python -m pip install --quiet \
-      "numpy==1.26.4" "scipy==1.17.1" "librosa==0.9.2" "setuptools==79.0.1" \
-      "matplotlib==3.9.4" inflect Unidecode tensorboard
-    python -c "import torch, numpy, scipy, librosa, matplotlib; print('torch', torch.__version__, '| numpy', numpy.__version__, '| scipy', scipy.__version__, '| librosa', librosa.__version__, '| matplotlib', matplotlib.__version__)"
-    python -c "import torch; print('cuda', torch.cuda.is_available(), '|', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU ONLY')"
     # ---- (c) pre-flight gates, before anything is paid for -------------------
     # The reproduction claim is "upstream's code, unmodified". Prove it by blob
     # hash rather than asserting it in prose. Upstream ships no .gitignore, so
@@ -234,7 +265,7 @@ setup:
 # extracting into the directory they already name leaves them unmodified.
 fetch_ljspeech:
   command: |
-    export PATH=/opt/pytorch/bin:$PATH
+    export PATH=/opt/row015-venv/bin:/opt/pytorch/bin:$PATH
     export PYTHONUNBUFFERED=1
     # ---- keep a halt from a CO-TENANT job off this machine -----------------
     # Repeated at the top of every stage, deliberately. Hosts on this target
@@ -269,7 +300,7 @@ fetch_ljspeech:
 # and three matplotlib figures -- rather than leaving that path untested.
 train:
   command: |
-    export PATH=/opt/pytorch/bin:$PATH
+    export PATH=/opt/row015-venv/bin:/opt/pytorch/bin:$PATH
     export PYTHONUNBUFFERED=1
     # ---- keep a halt from a CO-TENANT job off this machine -----------------
     # Repeated at the top of every stage, deliberately. Hosts on this target
@@ -288,7 +319,7 @@ train:
 
 label:
   command: |
-    export PATH=/opt/pytorch/bin:$PATH
+    export PATH=/opt/row015-venv/bin:/opt/pytorch/bin:$PATH
     # ---- keep a halt from a CO-TENANT job off this machine -----------------
     # Repeated at the top of every stage, deliberately. Hosts on this target
     # carry more than one job's work, and a `shutdown -h +N` armed by any of them
@@ -306,7 +337,7 @@ label:
 
 publish:
   command: |
-    export PATH=/opt/pytorch/bin:$PATH
+    export PATH=/opt/row015-venv/bin:/opt/pytorch/bin:$PATH
     # ---- keep a halt from a CO-TENANT job off this machine -----------------
     # Repeated at the top of every stage, deliberately. Hosts on this target
     # carry more than one job's work, and a `shutdown -h +N` armed by any of them
