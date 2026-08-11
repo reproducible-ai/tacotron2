@@ -114,14 +114,34 @@ def main() -> int:
     # Upstream's argparse must see exactly the arguments it declares.
     sys.argv = ["train.py"] + upstream_argv
 
-    # Must precede `import train`, which imports `hparams`, which imports
-    # `tensorflow` at module scope.
+    # ---- import order is load-bearing; do not simplify this ---------------
+    # The shim must be installed before `hparams` is imported, because
+    # hparams.py does `import tensorflow` at module scope. It must be withdrawn
+    # before `train` is imported, because train.py imports logger.py, which
+    # imports torch.utils.tensorboard, whose `_embedding.py:10` evaluates
+    #     _HAS_GFILE_JOIN = hasattr(tf.io.gfile, "join")
+    # at module import time against whatever `import tensorflow` returns. With
+    # the shim still in sys.modules that is
+    #     AttributeError: module 'tensorflow' has no attribute 'io'
+    # and the run dies before argument parsing. (Found in a bare-clone check on
+    # CPU, at $0, after a narrower probe that imported the same modules in a
+    # different order had passed -- which is the argument for always validating
+    # the whole recorded command rather than a piece of it.)
+    #
+    # Importing `hparams` here first also means train.py's own
+    # `from hparams import create_hparams` resolves from sys.modules and never
+    # re-triggers `import tensorflow`.
     import tf_hparams_shim  # noqa: E402  (repro/ is on sys.path)
 
     tf_hparams_shim.install()
+    import hparams as upstream_hparams  # noqa: E402
+
+    tf_hparams_shim.uninstall()
 
     import torch  # noqa: E402
     import train as upstream  # noqa: E402
+
+    assert upstream.create_hparams is upstream_hparams.create_hparams
 
     print(
         f"[env] torch {torch.__version__} | cuda available: "
@@ -154,9 +174,6 @@ def main() -> int:
 
     args = parser.parse_args()
     hparams = upstream.create_hparams(args.hparams)
-    # The shim has done its one job. Withdraw it before anything constructs a
-    # TensorBoard SummaryWriter -- see tf_hparams_shim.uninstall().
-    tf_hparams_shim.uninstall()
 
     torch.backends.cudnn.enabled = hparams.cudnn_enabled
     torch.backends.cudnn.benchmark = hparams.cudnn_benchmark

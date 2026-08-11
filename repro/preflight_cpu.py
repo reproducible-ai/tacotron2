@@ -169,6 +169,21 @@ def main() -> int:
         return (f"alignment {alignment.shape} spectrogram {spectrogram.shape} "
                 f"gate {gate.shape}")
 
+    @check("import train.py itself, with the shim already withdrawn")
+    def _train_module():
+        # This is the check that would have caught the ordering bug found in the
+        # bare-clone run: train.py -> logger.py -> torch.utils.tensorboard, whose
+        # _embedding.py evaluates `hasattr(tf.io.gfile, "join")` at import time
+        # against whatever `import tensorflow` returns. If the shim is still
+        # installed here, this import raises AttributeError.
+        import train as upstream
+
+        assert "tensorflow" not in sys.modules, (
+            "the TF shim is still installed; torch.utils.tensorboard will "
+            "route its file IO through it"
+        )
+        return f"train.train() present: {callable(upstream.train)}"
+
     @check("logger.Tacotron2Logger (torch.utils.tensorboard)")
     def _logger():
         from logger import Tacotron2Logger
